@@ -1,0 +1,2 @@
+Requests==2.32.3
+virtualbox==2.1.1
