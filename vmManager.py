@@ -1,143 +1,192 @@
-import virtualbox
-import time
+#!/usr/bin/env python3
+import subprocess
 import os
+import time
+import libvirt
+import xml.etree.ElementTree as ET
 from pathlib import Path
-import logging
-
+import requests
+import hashlib
+import pexpect
 from utils.utils import getOrCreateISO
 
-logging.basicConfig(level=logging.INFO)
-
-class VMManager:
-    def __init__(self, baseMemory=512):
-        self.vbox = virtualbox.VirtualBox()
-        self.baseMemory = baseMemory
-        self.hostPath = os.path.join(os.getcwd(), "sharedDir")
-
+class AlpineVMManager:
+    def __init__(self, iso_path):
+        self.conn = libvirt.open('qemu:///system')
+        if self.conn is None:
+            raise Exception("Failed to connect to QEMU/KVM")
         
-        if not os.path.exists(self.hostPath):
-            os.makedirs(self.hostPath)
+        # Base paths
+        self.base_dir = Path('/var/lib/libvirt')
+        self.images_dir = self.base_dir / 'images'
+        self.shared_dir = self.base_dir / 'shared'
+        self.iso_path = iso_path
+        
+        # Create shared directory if it doesn't exist
+        if not self.shared_dir.exists():
+            subprocess.run(['sudo', 'mkdir', '-p', str(self.shared_dir)])
+            subprocess.run(['sudo', 'chmod', '777', str(self.shared_dir)])
+    
+    def create_vm(self, name, memory_mb=512, vcpus=1, disk_size_gb=2):
+        """Create a new Alpine Linux VM"""
+        # Create disk image
+        disk_path = self.images_dir / f"{name}.qcow2"
+        subprocess.run([
+            'sudo', 'qemu-img', 'create', '-f', 'qcow2',
+            str(disk_path), f"{disk_size_gb}G"
+        ])
+        
+        # Define VM XML with Alpine specific settings
+        xml_config = f"""
+        <domain type='kvm'>
+            <name>{name}</name>
+            <memory unit='MiB'>{memory_mb}</memory>
+            <vcpu>{vcpus}</vcpu>
+            <os>
+                <type arch='x86_64'>hvm</type>
+                <boot dev='cdrom'/>
+                <boot dev='hd'/>
+            </os>
+            <features>
+                <acpi/>
+                <apic/>
+            </features>
+            <cpu mode='host-passthrough'/>
+            <devices>
+                <disk type='file' device='disk'>
+                    <driver name='qemu' type='qcow2'/>
+                    <source file='{disk_path}'/>
+                    <target dev='vda' bus='virtio'/>
+                </disk>
+                <disk type='file' device='cdrom'>
+                    <driver name='qemu' type='raw'/>
+                    <source file='{self.iso_path}'/>
+                    <target dev='hdc' bus='sata'/>
+                    <readonly/>
+                </disk>
+                <filesystem type='mount' accessmode='mapped'>
+                    <source dir='{self.shared_dir}'/>
+                    <target dir='shared'/>
+                </filesystem>
+                <interface type='network'>
+                    <source network='default'/>
+                    <model type='virtio'/>
+                </interface>
+                <serial type='pty'>
+                    <target port='0'/>
+                </serial>
+                <console type='pty'>
+                    <target type='serial' port='0'/>
+                </console>
+                <graphics type='vnc' port='-1' autoport='yes'/>
+            </devices>
+        </domain>
+        """
+        
+        domain = self.conn.defineXML(xml_config)
+        if domain is None:
+            raise Exception(f"Failed to create VM {name}")
+        
+        domain.create()
+        print(f"Created and started VM: {name}")
+        return domain
+    
+    def cleanup(self):
+        """Clean up resources and close connection"""
+        self.conn.close()
 
-    def create_vm(self, name, osType="Linux_64"):
-        """Create a new VM with the specified name and OS type"""
+    def automate_alpine_setup(self, vm_name, hostname, keyboard="us", disk_mode="sys", root_password="alpine123"):
+        """Automate the Alpine Linux installation process"""
+        # Give the VM some time to boot
+        time.sleep(10)
+        
+        # Start the virsh console session
+        console = pexpect.spawn(f'virsh console {vm_name}')
+        
         try:
-            vm = self.vbox.create_machine("", name, [], osType, "")
-
-            vm.memory_size = self.baseMemory
-            vm.cpu_count = 1
-            vm.cpu_property_set("PAE", True)
-            vm.bios_settings.io_apic_enabled = True
-            self.vbox.register_machine(vm)
+            # Initial login
+            console.expect('login:', timeout=30)
+            console.sendline('root')
             
-            session = virtualbox.Session()
-            vm.lock_machine(session, virtualbox.LockType.write)
+            # Start setup-alpine
+            console.expect('localhost:~#')
+            console.sendline('setup-alpine')
             
-            hdd = self.vbox.create_medium("", f"{name}_disk.vdi", 
-                                        virtualbox.DeviceType.hard_disk,
-                                        virtualbox.AccessMode.read_write)
+            # Handle setup questions
+            expectations = [
+                ("Select keyboard layout", keyboard),
+                ("Select variant", keyboard),
+                ("Enter system hostname", hostname),
+                ("Which one do you want to initialize", "eth0"),  # Select first network interface
+                ("Ip address for eth0", "dhcp"),
+                ("Do you want to do any manual network configuration", "n"),
+                ("New password", root_password),
+                ("Retype password", root_password),
+                ("Which timezone", "UTC"),
+                ("HTTP/FTP proxy URL", "none"),
+                ("Which NTP client to run", "chrony"),
+                ("Which SSH server", "openssh"),
+                ("Which disk\(s\) would you like to use", "vda"),
+                ("How would you like to use it", disk_mode),
+                ("WARNING: Erase the above disk\(s\) and continue", "y"),
+            ]
             
-            hdd.variant = virtualbox.MediumVariant.standard | virtualbox.MediumVariant.compressed
+            for expect_text, response in expectations:
+                console.expect(expect_text, timeout=30)
+                console.sendline(response)
+                time.sleep(1)
             
-            hdd.create_base_storage(5 * 1024 * 1024 * 1024)
+            # Wait for installation to complete
+            console.expect('Installation is complete', timeout=300)
             
-            storage = session.machine.add_storage_controller("SATA", 
-                                                          virtualbox.StorageBus.sata)
-            session.machine.attach_device(storage.name, 0, 0, 
-                                        virtualbox.DeviceType.hard_disk, hdd)
+            # Reboot the system
+            console.sendline('reboot')
             
-            dvdController = session.machine.add_storage_controller("IDE", 
-                                                                virtualbox.StorageBus.ide)
+            print(f"Successfully automated setup for VM: {vm_name}")
             
-            # Set up shared folder
-            session.machine.create_shared_folder("sharedDir", self.hostPath, 
-                                              True, True, "")
-            
-            # Enable page fusion to reduce memory usage
-            session.machine.page_fusion_enabled = True
-            
-            # Disable audio
-            session.machine.audio_adapter.enabled = False
-            
-            # Configure network adapter for NAT
-            adapter = session.machine.get_network_adapter(0)
-            adapter.attachment_type = virtualbox.NetworkAttachmentType.nat
-            adapter.enabled = True
-            
-            session.machine.save_settings()
-            session.unlock_machine()
-            
-            return True, f"Successfully created VM: {name}"
-            
-        except Exception as e:
-            return False, f"Failed to create VM: {str(e)}"
-
-    def attach_iso(self, vmName, isoPath):
-        """Attach ISO file to VM"""
-        try:
-            vm = self.vbox.find_machine(vmName)
-            session = virtualbox.Session()
-            vm.lock_machine(session, virtualbox.LockType.write)
-            
-            # Attach ISO to IDE controller
-            session.machine.attach_device("IDE", 1, 0,
-                                        virtualbox.DeviceType.dvd,
-                                        session.machine.create_medium_attachment("IDE", 1, 0,
-                                        virtualbox.DeviceType.dvd, isoPath))
-            
-            session.machine.save_settings()
-            session.unlock_machine()
-            return True, "ISO attached successfully"
-        except Exception as e:
-            return False, f"Failed to attach ISO: {str(e)}"
-
-    def start_vm(self, name):
-        """Start a VM using VirtualBox"""
-        try:
-            vm = self.vbox.find_machine(name)
-            session = virtualbox.Session()
-            progress = vm.launch_vm_process(session, "gui", [])
-            progress.wait_for_completion()
-            return True, f"Successfully started VM: {name}"
-        except Exception as e:
-            return False, f"Failed to start VM: {str(e)}"
-
-
-
+        except pexpect.exceptions.TIMEOUT:
+            print(f"Timeout occurred while setting up {vm_name}")
+            raise
+        finally:
+            console.close()
 
 def main():
-    # Initialize VM manager with 512MB RAM per VM
-    vm_manager = VMManager(baseMemory=512)
+    if os.geteuid() != 0:
+        print("This script needs to be run as root (sudo)")
+        return
     
-    # isoPath = "/path/to/alpine-standard-3.19.0-x86_64.iso"
-    isoPath = ""
     try:
-        isoPath = getOrCreateISO("dl-cdn.alpinelinux.org", "3.20.0", "aarch64")
-    except Exception as e:
-        logging.info("Error: {e}".format(e = e))
-        exit()
-    
-    # VM names
-    vmNames = ["Alpine_VM1", "Alpine_VM2", "Alpine_VM3"]
-    
-    # Create and start VMs one by one
-    for vmName in vmNames:
-        logging.info(f"\nCreating {vmName}...")
-        success, message = vm_manager.create_vm(vmName)
-        logging.info(message)
+        # Download Alpine Linux ISO
+        iso_path = getOrCreateISO("dl-cdn.alpinelinux.org", "3.20.0", "x86_64")
         
-        if success:
-            # Attach ISO
-            logging.info(f"Attaching Alpine Linux ISO to {vmName}...")
-            success, message = vm_manager.attach_iso(vmName, isoPath)
-            logging.info(message)
-            
-            if success:
-                logging.info(f"Starting {vmName}...")
-                success, message = vm_manager.start_vm(vmName)
-                logging.info(message)
-            
-            # Wait between VM creations
-            time.sleep(15)
+        # Initialize manager with ISO path
+        manager = AlpineVMManager(iso_path)
+        
+        # Create 3 VMs
+        vm_configs = [
+            {"name": "alpine1", "memory_mb": 512, "vcpus": 1, "disk_size_gb": 2},
+            {"name": "alpine2", "memory_mb": 512, "vcpus": 1, "disk_size_gb": 2},
+            {"name": "alpine3", "memory_mb": 512, "vcpus": 1, "disk_size_gb": 2}
+        ]
+        
+        vms = []
+        for config in vm_configs:
+            vm = manager.create_vm(**config)
+            vms.append(vm)
+        
+        print("\nAll Alpine Linux VMs created successfully!")
+        print("\nSetup Instructions:")
+        print("\n1. For each VM, connect to console:")
+        for config in vm_configs:
+            print(f"   sudo virsh console {config['name']}")
+        
+        print("\nShared directory path on host:", manager.shared_dir)
+        
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if 'manager' in locals():
+            manager.cleanup()
 
 if __name__ == "__main__":
     main()

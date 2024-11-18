@@ -6,10 +6,7 @@ logging.basicConfig(level=logging.INFO)
 
 def getOrCreateISO(url: str, version: str, architecture: str) -> str:
 
-    downloadUrl = "https://{url}/alpine/v{versionPrefix}/releases/{architecture}/alpine-standard-{version}-{architecture}.iso" \
-        .format(url=url, versionPrefix=".".join(version.split(".")[:2]), version = version, architecture=architecture)
-
-    response = requests.get(downloadUrl)
+    
     
     file_path = os.path.join(os.getcwd(), "utils", "alpine-standard-{version}-{architecture}.iso".
                             format(version=version, architecture=architecture))
@@ -18,6 +15,10 @@ def getOrCreateISO(url: str, version: str, architecture: str) -> str:
         logging.info("ISO file exists: {path}".format(path = file_path))
         return file_path
     else:
+        downloadUrl = "https://{url}/alpine/v{versionPrefix}/releases/{architecture}/alpine-standard-{version}-{architecture}.iso" \
+        .format(url=url, versionPrefix=".".join(version.split(".")[:2]), version = version, architecture=architecture)
+        logging.info("Download URl - ", downloadUrl)
+        response = requests.get(downloadUrl)
         if response.status_code == 200:
             with open(file_path, "wb") as file:
                 for chunk in response.iter_content(1024):
